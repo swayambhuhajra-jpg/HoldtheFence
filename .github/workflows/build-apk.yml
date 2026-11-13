@@ -1,0 +1,87 @@
+name: Build Hold the Fence APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HAS_KEY: ${{ secrets.KEYSTORE_BASE64 != '' }}
+    steps:
+      - name: Get the repo files
+        uses: actions/checkout@v4
+
+      - name: Unpack the Android project
+        run: |
+          unzip -q HoldTheFence-Android.zip -d .
+          if [ -f index.html ]; then cp index.html app/www/index.html; echo "Using index.html from the repo"; fi
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Check Android SDK
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > app/android/local.properties
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Install packages and copy the game into Android
+        working-directory: app
+        run: |
+          npm ci
+          npx cap sync android
+          VER=$(grep -oP 'versionName "\K[^"]+' android/app/build.gradle)
+          echo "Hold the Fence v$VER" | tee ../version.txt
+
+      - name: Build debug APK
+        working-directory: app/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+          mkdir -p ../../out
+          cp app/build/outputs/apk/debug/app-debug.apk ../../out/HoldTheFence-debug.apk
+
+      - name: Build signed release AAB (only when the signing key secrets are set)
+        if: env.HAS_KEY == 'true'
+        working-directory: app/android
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > ../holdthefence-upload.jks
+          cat > keystore.properties <<PROPS
+          storeFile=../../holdthefence-upload.jks
+          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.KEY_ALIAS }}
+          keyPassword=${{ secrets.KEY_PASSWORD }}
+          PROPS
+          ./gradlew bundleRelease assembleRelease --no-daemon
+          cp app/build/outputs/bundle/release/app-release.aab ../../out/HoldTheFence-release.aab
+          cp app/build/outputs/apk/release/app-release.apk ../../out/HoldTheFence-release.apk
+
+      - name: Save the APK for download
+        uses: actions/upload-artifact@v4
+        with:
+          name: HoldTheFence-build-${{ github.run_number }}
+          path: out/
+          retention-days: 30
+
+      - name: Publish the APK on the Releases page
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" out/*.apk \
+            --repo "${{ github.repository }}" \
+            --title "Hold the Fence build ${{ github.run_number }}" \
+            --notes "$(cat version.txt) — Open this page on your phone and tap HoldTheFence-debug.apk to install it." \
+            --latest
