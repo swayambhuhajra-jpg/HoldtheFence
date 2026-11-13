@@ -1,0 +1,94 @@
+# Hold the Fence - builds the Android APK on GitHub's servers.
+# Runs on every upload (push) and from the "Run workflow" button in the Actions tab.
+# This file must live at .github/workflows/build-apk.yml in the repo.
+name: Build Hold the Fence APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # lets the build publish the APK on the Releases page
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HAS_KEY: ${{ secrets.KEYSTORE_BASE64 != '' }}
+    steps:
+      - name: Get the repo files
+        uses: actions/checkout@v4
+
+      - name: Unpack the Android project
+        run: |
+          unzip -q HoldTheFence-Android.zip -d .
+          # A newer game file at the top of the repo replaces the one inside the zip
+          if [ -f index.html ]; then cp index.html app/www/index.html; echo "Using index.html from the repo"; fi
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Check Android SDK (already installed on GitHub's machines)
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "sdk.dir=$ANDROID_HOME" > app/android/local.properties
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Install packages and copy the game into Android
+        working-directory: app
+        run: |
+          npm ci
+          npx cap sync android
+          test -f android/app/src/main/assets/public/index.html || { echo "::error::index.html did not reach the Android assets"; exit 1; }
+          VER=$(grep -oP 'versionName "\K[^"]+' android/app/build.gradle)
+          echo "Hold the Fence v$VER" | tee ../version.txt
+
+      - name: Build debug APK (for testing)
+        working-directory: app/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+          mkdir -p ../../out
+          cp app/build/outputs/apk/debug/app-debug.apk ../../out/HoldTheFence-debug.apk
+
+      - name: Build signed release AAB (only when the signing key secrets are set)
+        if: env.HAS_KEY == 'true'
+        working-directory: app/android
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > ../holdthefence-upload.jks
+          cat > keystore.properties <<PROPS
+          storeFile=../../holdthefence-upload.jks
+          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.KEY_ALIAS }}
+          keyPassword=${{ secrets.KEY_PASSWORD }}
+          PROPS
+          ./gradlew bundleRelease assembleRelease --no-daemon
+          cp app/build/outputs/bundle/release/app-release.aab ../../out/HoldTheFence-release.aab
+          cp app/build/outputs/apk/release/app-release.apk ../../out/HoldTheFence-release.apk
+
+      - name: Save the APK for download
+        uses: actions/upload-artifact@v4
+        with:
+          name: HoldTheFence-build-${{ github.run_number }}
+          path: out/
+          retention-days: 30
+
+      - name: Publish the APK as a direct download (Releases page)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="build-${{ github.run_number }}"
+          gh release create "$TAG" out/*.apk \
+            --repo "${{ github.repository }}" \
+            --title "Hold the Fence build ${{ github.run_number }}" \
+            --notes "$(cat version.txt 2>/dev/null) — Open this page on your phone and tap HoldTheFence-debug.apk to download and install it." \
+            --latest
